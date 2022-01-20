@@ -1,0 +1,825 @@
+---
+title: "Fin_v_Body_RNA-seq"
+author: "Joshua Weiss"
+date: "6/22/2020"
+output: html_document
+---
+
+Libraries:
+``` {r, message = F, warning = F}
+library(DESeq2)
+library(tidyverse)
+library(gridExtra)
+library(ggfortify)
+library(RColorBrewer)
+library(gplots)
+library(biomaRt)
+library(GenomicFeatures)
+library(xlsx)
+library("readxl")
+library(ggplot2)
+library(ggrepel)
+require(fgsea)
+require(msigdbr)
+require(limma)
+```
+
+Import counts tables
+``` {r}
+
+#import sample list
+Sample_List <- read.table("/Users/weiss/Desktop/White Lab/Projects/Patient XYZ/RNA-seq/Adult FACS RNA-seq/RNA-seq_030420/RNA-seq_files_030420/Sample_List.txt", header = FALSE, quote = "")
+
+#import the sample datafiles
+for (ii in 1:nrow(Sample_List)) {
+  sample <- Sample_List[ii,]
+  path <- paste0("/Users/weiss/Desktop/White Lab/Projects/Patient XYZ/RNA-seq/Adult FACS RNA-seq/RNA-seq_030420/RNA-seq_files_030420/geo_submission_092320/", sample)
+  filename <- paste0(sample, ".ReadsPerGene.out.tab")
+  data <- read.delim(paste(path, filename, sep = "/"), skip = 3)
+  data[,3:4] <- NULL
+  colnames(data)[1:2] <- c("Ensembl", sample)
+  assign(x = sample, value = data)
+  rm(data)
+}
+
+```
+
+Merge the count tables together
+``` {r}
+matrix_all <- merge(x = MBG1, 
+                    y = MBG2,
+                    by = "Ensembl")
+
+#Loop to merge all the sample data together. Loop starts at 3 because the first 2 were already merged together.
+for (ii in 3:nrow(Sample_List)) {
+  sample <- Sample_List[ii,]
+  data <- eval(parse(text = sample))
+  matrix_all <- merge(x = matrix_all, 
+                      y = data,
+                      by = "Ensembl")
+}
+matrix_all <- column_to_rownames(matrix_all, var = "Ensembl")
+
+```
+
+Add info to Sample_List
+```{r}
+colnames(Sample_List) <- "sample"
+Sample_List$group <- c(rep("MBG",3), rep("MBN",3), rep("MFG",3), rep("MFN",3), rep("XBG",3), rep("XBN",3), rep("XFG",3), rep("XFN",3))
+Sample_List$genotype <- c(rep("Control", 12), rep("Acral", 12))
+Sample_List$location <- c(rep("Body", 6), rep("Fin", 6), rep("Body", 6), rep("Fin", 6))
+Sample_List$celltype <- c(rep("Melanocyte",3), rep("TME",3), rep("Melanocyte",3), rep("TME",3), rep("Melanocyte",3), rep("TME",3), rep("Melanocyte",3), rep("TME",3))
+Sample_List$batch <- rep(1:3, 8)
+```
+
+Plot GFP expression for samples as a quality check
+```{r}
+#plot GFP for every sample
+data_GFP <- matrix_all[rownames(matrix_all) == "EGFP",] %>%
+  t() %>%
+  data.frame() %>%
+  rownames_to_column(var = "sample")
+
+data_GFP$group <- c(rep("MBG",3), rep("MBN",3), rep("MFG",3), rep("MFN",3), rep("XBG",3), rep("XBN",3), rep("XFG",3), rep("XFN",3))
+
+GFP_plot <- ggplot(data_GFP, aes(x = group, y = EGFP, fill = group)) +
+              geom_boxplot() +
+              ylab("EGFP raw counts") +
+              xlab("sample group") +
+              theme(axis.text.x = element_text(angle = 45, vjust = 0.5, size = 14),
+              legend.position = "none",
+              axis.title = element_text(size = 16, face = "bold"))
+GFP_plot
+```
+
+Filter out genes with low to no expression from matrix_all
+```{r}
+#filter out genes with few to no counts
+keep <- rowSums(matrix_all, na.rm = TRUE) > 24
+matrix_all <- matrix_all[keep,]
+dim(matrix_all)
+```
+Plot library size
+```{r}
+#plot library size by sample name
+librarySizes <- colSums(matrix_all)
+barplot(librarySizes, 
+        names=names(librarySizes), 
+        las=2, 
+        main="Barplot of library sizes")
+abline(h=20e6, lty=2)
+```
+
+Rlog transform the data for PCA and Hierarchical clustering
+```{r}
+matrix_all_mx <- as.matrix(matrix_all)
+rlog_count <- rlog(matrix_all_mx, blind = FALSE)
+head(rlog_count)
+rownames(rlog_count) <- rownames(matrix_all_mx)
+
+#plot library size after the rlog transformation
+statusCol <- as.numeric(factor(data_GFP$group))
+# Check distributions of samples using boxplots
+boxplot(rlog_count, 
+        xlab="", 
+        ylab="Log2(Counts)",
+        las=2,
+        col=statusCol)
+# Let's add a blue horizontal line that corresponds to the median logCPM
+abline(h=median(as.matrix(rlog_count)), col="blue")
+```
+PCA
+```{r}
+pcDat <- prcomp(t(rlog_count))
+
+autoplot(pcDat,
+         data = data_GFP,
+         colour="group",
+         size=4,
+         scale = TRUE) +
+         scale_color_brewer(palette = "Accent") + 
+         ggtitle("PCA of melanocytes and microenvironment") +
+         theme_bw() +
+         geom_text(label=colnames(rlog_count)) +
+         theme(axis.text=element_text(size = 18, face = "bold"),
+               axis.title=element_text(size = 20,face="bold"),
+               plot.title=element_text(size = 20, face = "bold", hjust = 0.5),
+               legend.text=element_text(size = 18, face = "bold"))
+
+
+```
+Unsupervised clustering heatmap
+```{r}
+# We estimate the variance for each row in the logcounts matrix
+countVar <- apply(rlog_count, 1, var)
+# Get the row numbers for the top 500 most variable genes
+highVar <- order(countVar, decreasing=TRUE)[1:500]
+# Subset logcounts matrix
+hmDat <- rlog_count[highVar,]
+
+# Get some nicer colours
+mypalette <- brewer.pal(11, "RdYlBu")
+# http://colorbrewer2.org/#type=sequential&scheme=BuGn&n=3
+morecols <- colorRampPalette(mypalette)
+# Set up colour vector for group variable
+data_GFP$group <- as.factor(data_GFP$group)
+col.cell <- as.character(brewer.pal(8, "Accent"))[data_GFP$group]
+# Plot the heatmap
+
+heatmap.2(hmDat,
+          col=rev(morecols(50)),
+          dendrogram = "column",
+          trace="none", 
+          main="Top 500 most variable genes across samples",
+          ColSideColors=col.cell,scale="row",
+          density.info = "none",
+          keysize = 1.5)
+```
+
+
+Run DESeq2
+```{r}
+# first lets check that our rows and columns match
+all(Sample_List$sample == colnames(matrix_all_mx))
+# create the design formula
+design <- as.formula(~ group)
+#designBvF <- as.formula(~ celltype + genotype + location)
+
+# create the DESeqDataSet object
+ddsObj <- DESeqDataSetFromMatrix(countData = matrix_all_mx,
+                              colData = Sample_List,
+                              design = design)
+# Run DESeq
+ddsObj <- DESeq(ddsObj, betaPrior = TRUE)
+```
+
+Generate a results table for comparisons of interest
+```{r cars}
+#compare Acral fin melanocytes to Acral body melanocytes
+resXFGvXBG <- results(ddsObj, alpha=0.05, contrast = c("group", "XFG", "XBG"))
+head(resXFGvXBG)
+
+#compare Control fin melanocytes to Control body melanocytes
+resMFGvMBG <- results(ddsObj, alpha=0.05, contrast = c("group", "MFG", "MBG"))
+head(resMFGvMBG)
+
+#compare Acral fin melanocytes to Control fin melanocytes
+resXFGvMFG <- results(ddsObj, alpha=0.05, contrast = c("group", "XFG", "MFG"))
+head(resXFGvMFG)
+
+#compare Acral body melanocytes to Control body melanocytes
+resXBGvMBG <- results(ddsObj, alpha=0.05, contrast = c("group", "XBG", "MBG"))
+head(resXBGvMBG)
+
+#compare Acral fin TME to Acral body TME
+resXFNvXBN <- results(ddsObj, alpha=0.05, contrast = c("group", "XFN", "XBN"))
+head(resXFNvXBN)
+
+#compare Control fin TME to Control body TME
+resMFNvMBN <- results(ddsObj, alpha=0.05, contrast = c("group", "MFN", "MBN"))
+head(resMFNvMBN)
+
+#compare Acral fin TME to Control fin TME
+resXFNvMFN <- results(ddsObj, alpha=0.05, contrast = c("group", "XFN", "MFN"))
+head(resXFNvMFN)
+
+#compare Acral body TME to Control body TME
+resXBNvMBN <- results(ddsObj, alpha=0.05, contrast = c("group", "XBN", "MBN"))
+head(resXBNvMBN)
+
+#compare Acral fin melanocytes to Acral fin TME
+resXFGvXFN <- results(ddsObj, alpha=0.05, contrast = c("group", "XFG", "XFN"))
+head(resXFGvXFN)
+
+#compare Acral body melanocytes to Acral body TME
+resXBGvXBN <- results(ddsObj, alpha=0.05, contrast = c("group", "XBG", "XBN"))
+head(resXBGvXBN)
+
+#compare Control fin melanocytes to Control fin TME
+resMFGvMFN <- results(ddsObj, alpha=0.05, contrast = c("group", "MFG", "MFN"))
+head(resMFGvMFN)
+
+#compare Control body melanocytes to Control body TME
+resMBGvMBN <- results(ddsObj, alpha=0.05, contrast = c("group", "MBG", "MBN"))
+head(resMBGvMBN)
+
+```
+Assign zebrafish gene names to Ensembl IDs
+```{r}
+mart <- useDataset("drerio_gene_ensembl", useMart("ensembl"))
+
+
+res_list = list(matrix_all_mx = as.data.frame(matrix_all_mx),
+                rlog_count = as.data.frame(rlog_count),
+                resXFGvXBG = as.data.frame(resXFGvXBG),
+                resMFGvMBG = as.data.frame(resMFGvMBG),
+                resXFGvMFG = as.data.frame(resXFGvMFG),
+                resXBGvMBG = as.data.frame(resXBGvMBG),
+                resXFNvXBN = as.data.frame(resXFNvXBN),
+                resMFNvMBN = as.data.frame(resMFNvMBN),
+                resXFNvMFN = as.data.frame(resXFNvMFN),
+                resXBNvMBN = as.data.frame(resXBNvMBN),
+                resXFGvXFN = as.data.frame(resXFGvXFN),
+                resXBGvXBN = as.data.frame(resXBGvXBN),
+                resMFGvMFN = as.data.frame(resMFGvMFN),
+                resMBGvMBN = as.data.frame(resMBGvMBN))
+                
+res_list_named = lapply(res_list, function(j) {
+  j %>% 
+    rownames_to_column(., "Ensembl") %>%
+    merge(x = .,
+          y = getBM(filters = "ensembl_gene_id", 
+                    attributes = c("ensembl_gene_id","description", "wikigene_name"),
+                    values = .$Ensembl, 
+                    mart = mart),
+          by.x = "Ensembl",
+          by.y = "ensembl_gene_id") %>%
+    .[.$wikigene_name != "",]
+})
+
+
+matrix_all_named <- res_list_named[["matrix_all_mx"]]
+rlog_count_named <- res_list_named[["rlog_count"]]
+resXFGvXBG_named <- res_list_named[["resXFGvXBG"]]
+resMFGvMBG_named <- res_list_named[["resMFGvMBG"]]
+resXFGvMFG_named <- res_list_named[["resXFGvMFG"]]
+resXBGvMBG_named <- res_list_named[["resXBGvMBG"]]
+resXFNvXBN_named <- res_list_named[["resXFNvXBN"]]
+resMFNvMBN_named <- res_list_named[["resMFNvMBN"]]
+resXFNvMFN_named <- res_list_named[["resXFNvMFN"]]
+resXBNvMBN_named <- res_list_named[["resXBNvMBN"]]
+resXFGvXFN_named <- res_list_named[["resXFGvXFN"]]
+resXBGvXBN_named <- res_list_named[["resXBGvXBN"]]
+resMFGvMFN_named <- res_list_named[["resMFGvMFN"]]
+resMBGvMBN_named <- res_list_named[["resMBGvMBN"]]
+
+resXFGvXBG_named <- subset(resXFGvXBG_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resMFGvMBG_named <- subset(resMFGvMBG_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXFGvMFG_named <- subset(resXFGvMFG_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXBGvMBG_named <- subset(resXBGvMBG_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXFNvXBN_named <- subset(resXFNvXBN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resMFNvMBN_named <- subset(resMFNvMBN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXFNvMFN_named <- subset(resXFNvMFN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXBNvMBN_named <- subset(resXBNvMBN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXFGvXFN_named <- subset(resXFGvXFN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resXBGvXBN_named <- subset(resXBGvXBN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resMFGvMFN_named <- subset(resMFGvMFN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+resMBGvMBN_named <- subset(resMBGvMBN_named) %>% 
+  dplyr::select(wikigene_name, everything()) %>%
+  arrange(desc(log2FoldChange))
+```
+
+Assign human orthologue gene names
+```{r}
+# convert counts matrix to human
+#the list of zebrafish to human gene orthologues can be found in the second tab of Table S4
+fish.human.convert <- readxl::read_excel("/Users/weiss/Documents/R/Learning RNA-seq/ZMEL_ANC_vs_EVO/Zebrafish_to_Human_new_R_XYZ.xlsx")
+deseq_matrix_df <- matrix_all_mx %>% data.frame()
+deseq_matrix_df <- deseq_matrix_df %>% rownames_to_column(var = "Ensembl")
+
+deseq_matrix_allgenes <- merge(x = deseq_matrix_df,
+               y = fish.human.convert,
+               by = "Ensembl") 
+deseq_matrix_allgenes <- deseq_matrix_allgenes[c(1,26,29,2:25)]
+
+deseq_matrix_human <- deseq_matrix_allgenes[!deseq_matrix_allgenes$Human_Symbol_Unique == "NA", ] 
+
+#add gene names to rlog normalized counts
+deseq_rlog_df <- rlog_count %>% data.frame()
+deseq_rlog_df <- deseq_rlog_df %>% rownames_to_column(var = "Ensembl")
+deseq_rlog_df <- merge(x = deseq_rlog_df,
+               y = fish.human.convert,
+               by = "Ensembl")
+rlog_named <- deseq_rlog_df[,c(1,26,29,2:25)]
+```
+
+Approach to unique Ensemble IDs mapped to the same gene name
+```{r}
+#Unique Ensembl IDs in some cases are mapped to the same gene. In the case of these duplicates, one will get the gene name and the other will have the Ensembl ID in order to keep both. 
+duplicated_genes <- duplicated(rlog_named$Zebrafish_Symbol)
+rlog_named$Zebrafish_Symbol[duplicated_genes] <- rlog_named$Ensembl[duplicated_genes]
+#update to convert Ensembl ID for hoxc13b
+ENSDARG00000113877 <- rlog_named$Ensembl == "ENSDARG00000113877"
+rlog_named$Zebrafish_Symbol[ENSDARG00000113877] <- "hoxc13b"
+
+#remove Ensembl ID column and make zebrafish gene names the row name of the dataframe
+rlog_only_genenames <- rlog_named[,c(2:26)]
+rownames(rlog_only_genenames) <- NULL
+rlog_only_genenames <- rlog_only_genenames %>% column_to_rownames(var = "Zebrafish_Symbol")
+
+deseq_rlog_allgenes <- merge(x = deseq_rlog_df,
+               y = fish.human.convert,
+               by = "Ensembl") 
+deseq_rlog_allgenes <- deseq_rlog_allgenes[c(1,26:29,2:25)]
+```
+
+Make boxplots for genes of interest
+```{r}
+
+transgenes <- c("EGFP", "mitfa", "hsCRKL", "hsGAB2", "Cas9_mCherry", "hshTERT", "nf1a", "nf1b")
+transgene_plots <- paste0(transgenes,"_plot")
+
+for (ii in 1:length(transgenes)) {
+  gene_ii <- transgenes[ii]
+  data_ii <- deseq_rlog_allgenes[deseq_rlog_allgenes$Zebrafish_Symbol == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample") %>%
+    .[6:29,]
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- Sample_List$group
+  
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = as.numeric(gene_id), fill = factor(group))) +
+              geom_point() +
+              geom_boxplot() +
+              scale_fill_brewer(palette = "Accent") +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text=element_text(size = 12, face = "bold"),
+                axis.text.x = element_text(angle = 45, vjust = 0.5),
+                legend.position = "none",
+                axis.title=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5))
+            
+  assign(x = transgene_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(EGFP_plot,mitfa_plot, hsCRKL_plot, hsGAB2_plot, hshTERT_plot, Cas9_mCherry_plot, nrow = 2)
+
+
+#boxplot for igf
+transgenes <- c("igf1", "igf2a", "igf2b")
+transgene_plots <- paste0(transgenes,"_plot")
+deseq_rlog_melanocytes <- deseq_rlog_allgenes[,c(1:8,12:14,18:20,24:26)] 
+
+for (ii in 1:length(transgenes)) {
+  gene_ii <- transgenes[ii]
+  data_ii <- deseq_rlog_allgenes[deseq_rlog_melanocytes$Zebrafish_Symbol == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample") %>%
+    .[6:29,]
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- Sample_List$group
+  data_ii$group <- factor(data_ii$group, levels = c("MBG", "MFG", "XBG", "XFG"))
+  data_ii <- na.omit(data_ii)
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = as.numeric(gene_id), fill = factor(group))) +
+              geom_point() +
+              geom_boxplot() +
+              scale_fill_manual(values = c("#7FC97F", "#FDC086", "#386CB0", "#BF5B17")) +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text=element_text(size = 12, face = "bold"),
+                axis.text.x = element_blank(),
+                legend.position = "none",
+                axis.title=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5))
+            
+  assign(x = transgene_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(igf1_plot, igf2a_plot, igf2b_plot, nrow = 1)
+
+```
+
+Plot hox gene expression
+```{r}
+#create boxplots for all the zebrafish hox genes
+deseq_rlog_hox_genes <- deseq_rlog_allgenes[grep(pattern = "hox", 
+                                    x = deseq_rlog_allgenes$Zebrafish_Symbol), ]
+dim(deseq_rlog_hox_genes)
+deseq_rlog_hox_genes <- deseq_rlog_hox_genes[grep(pattern = "shox|phox2a", 
+                                    x = deseq_rlog_hox_genes$Zebrafish_Symbol,
+                                    invert = TRUE, 
+                                    ignore.case = TRUE), ] #remove shox and phox2a genes
+dim(deseq_rlog_hox_genes)
+
+
+hox_genes <- deseq_rlog_hox_genes$Zebrafish_Symbol
+hox_plots <- paste0(hox_genes,"_plot")
+
+display.brewer.pal(n = 8, name = 'Accent')
+brewer.pal(n = 8, name = "Accent")
+
+for (ii in 1:length(hox_genes)) {
+  gene_ii <- hox_genes[ii]
+  data_ii <- deseq_rlog_hox_genes[deseq_rlog_hox_genes$Zebrafish_Symbol == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample") %>%
+    .[6:29,]
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- Sample_List$group
+  data_ii$group <- factor(data_ii$group, levels = c("MBG","XBG","MBN","XBN", "MFG", "XFG", "MFN", "XFN"))
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = as.numeric(gene_id), fill = factor(group))) +
+              geom_point() +
+              geom_boxplot() +
+              scale_fill_manual(values = c("#7FC97F", "#386CB0", "#BEAED4", "#F0027F", "#FDC086", "#BF5B17", "#FFFF99", "#666666")) +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text=element_text(size = 12, face = "bold"),
+                axis.text.x = element_blank(),
+                legend.position = "none",
+                axis.title=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5))
+            
+  assign(x = hox_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(hoxb1b_plot,
+             hoxa2b_plot,hoxb2a_plot,
+             hoxa3a_plot,hoxb3a_plot,hoxc3a_plot,hoxd3a_plot,
+             hoxb4a_plot,hoxc4a_plot,hoxd4a_plot,
+             hoxa5a_plot,hoxb5a_plot,hoxb5b_plot,hoxc5a_plot,
+             hoxb6a_plot,hoxc6a_plot,hoxc6b_plot,
+             hoxb7a_plot,
+             hoxb8a_plot,hoxb8b_plot,hoxc8a_plot,
+             hoxa9a_plot,hoxa9b_plot,hoxb9a_plot,hoxc9a_plot,hoxd9a_plot,
+             hoxa10b_plot,hoxb10a_plot,hoxd10a_plot,
+             hoxa11a_plot,hoxa11b_plot,hoxc11a_plot,hoxc11b_plot,hoxd11a_plot,
+             hoxc12a_plot,hoxc12b_plot,hoxd12a_plot,
+             hoxa13a_plot,hoxa13b_plot,hoxb13a_plot,hoxc13a_plot,hoxd13a_plot,
+             nrow = 9)
+```
+
+Perform unsupervised clustering based on hox gene expression
+```{r}
+# We estimate the variance for each row in the logcounts matrix
+countVar_hox <- apply(deseq_rlog_hox_genes, 1, var)
+highVar_hox <- order(countVar_hox, decreasing=TRUE)
+# Subset logcounts matrix
+hmDat_hox <- deseq_rlog_hox_genes %>%
+              .[-c(35),] %>% #remove duplicate hoxc9a
+              remove_rownames() %>%
+              column_to_rownames(.,var = "Zebrafish_Symbol.x") %>%
+              .[,5:28] %>%
+              as.matrix()
+
+# Get some nicer colours
+mypalette <- brewer.pal(11, "RdYlBu")
+# http://colorbrewer2.org/#type=sequential&scheme=BuGn&n=3
+morecols <- colorRampPalette(mypalette)
+# Set up colour vector for group variable
+Sample_List$group <- as.factor(Sample_List$group)
+col.cell <- as.character(brewer.pal(8, "Accent"))[Sample_List$group]
+# Plot the heatmap
+
+heatmap.2(hmDat_hox,
+          col=rev(morecols(50)),
+          dendrogram = "column",
+          trace="none", 
+          main="Unsupervised Clustering by HOX gene Expression",
+          ColSideColors=col.cell,scale="row",
+          density.info = "none",
+          key = F)
+
+```
+
+Convert gene names to Human orthologue for pathway analysis
+```{r}
+source("/Users/weiss/Documents/R/Functions/convert_DESeq2_human.r")
+resXFGvXBG_genelist <- convert_DESeq2_human(resXFGvXBG_named)
+resMFGvMBG_genelist <- convert_DESeq2_human(resMFGvMBG_named)
+resXFGvMFG_genelist <- convert_DESeq2_human(resXFGvMFG_named)
+resXBGvMBG_genelist <- convert_DESeq2_human(resXBGvMBG_named)
+resXFNvXBN_genelist <- convert_DESeq2_human(resXFNvXBN_named)
+resMFNvMBN_genelist <- convert_DESeq2_human(resMFNvMBN_named)
+resXFNvMFN_genelist <- convert_DESeq2_human(resXBGvMBG_named)
+resXBNvMBN_genelist <- convert_DESeq2_human(resXBGvMBG_named)
+resXFGvXFN_genelist <- convert_DESeq2_human(resXFGvXFN_named)
+resXBGvXBN_genelist <- convert_DESeq2_human(resXBGvXBN_named)
+resMFGvMFN_genelist <- convert_DESeq2_human(resMFGvMFN_named)
+resMBGvMBN_genelist <- convert_DESeq2_human(resMBGvMBN_named)
+```
+
+
+Create a volcano plot
+```{r}
+comparison_labels <- c("Acral fin melanocytes vs Acral body melanocytes", "Control fin melanocytes vs Control body melanocytes", "Acral fin melanocytes vs Control fin melanocytes", "Acral body melanocytes vs Control body melanocytes", "Acral fin TME vs Acral body TME", "Control fin TME vs Control body TME", "Acral fin TME vs Control fin TME", "Acral body TME vs Control body TME", "Acral fin melanocytes vs Acral fin TME", "Acral body melanocytes vs Acral body TME", "Control fin melanocytes vs Control fin TME", "Control body melanocytes vs Control body TME")
+
+genelist <- c("resXFGvXBG_genelist", "resMFGvMBG_genelist", "resXFGvMFG_genelist", "resXBGvMBG_genelist", "resXFNvXBN_genelist", "resMFNvMBN_genelist", "resXFNvMFN_genelist", "resXBNvMBN_genelist", "resXFGvXFN_genelist", "resXBGvXBN_genelist", "resMFGvMFN_genelist", "resMBGvMBN_genelist")
+
+genelist_named <- c("resXFGvXBG_named", "resMFGvMBG_named", "resXFGvMFG_named", "resXBGvMBG_named", "resXFNvXBN_named", "resMFNvMBN_named", "resXFNvMFN_named", "resXBNvMBN_named", "resXFGvXFN_named", "resXBGvXBN_named", "resMFGvMFN_named", "resMBGvMBN_named") #to plot the zebrafish genes
+
+#make a plot that labels particular HOX genes
+volc_hox_genes <- c("hoxb7a", "hoxb9a", "hoxc13a", "hoxa13a", "hoxa13b", "hoxb13a", "hoxd13a", "hoxc13b", "hoxb8a", "hoxb5a", "hoxb6a")
+for (ii in 1:length(genelist_named)) {
+  sample <- genelist_named[ii]
+  data_ii <- eval(parse(text = sample))
+  data_ii <- data_ii %>% 
+    mutate(TopGeneLabel=ifelse(wikigene_name %in% volc_hox_genes, `wikigene_name`, ""))
+    dim(data_ii)
+  
+  y_volc <- -log10(data_ii$pvalue)
+  volc_plot <- ggplot(data_ii, aes(x = log2FoldChange, y = y_volc)) +
+    ggtitle(label = comparison_labels[ii]) +
+    geom_point(aes(colour=padj < 0.05), shape=20, size=0.75) +
+    geom_text_repel(aes(label=TopGeneLabel), size = 9, box.padding = 1.0, segment.alpha = 0.5) +
+    labs(x="logFC", y="-log10(pvalue)") +
+    scale_color_manual(values = c("gray", "blue")) + 
+    theme_bw() +
+    theme(axis.text=element_text(size = 22),
+          axis.title=element_text(size = 22,face="bold"),
+          plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+          legend.title = element_text(size = 22, face = "bold"),
+          legend.text=element_text(size = 18))
+  
+  grid.arrange(volc_plot)
+  
+}
+
+#make a plot that labels particular melanocyte genes
+melanocyte_genes <- c("tyrp1a", "mlpha", "pmela", "mitfa", "sox10", "tyr", "dct")
+for (ii in 1:length(genelist_named)) {
+  sample <- genelist_named[ii]
+  data_ii <- eval(parse(text = sample))
+  data_ii <- data_ii %>% 
+    mutate(TopGeneLabel=ifelse(wikigene_name %in% melanocyte_genes, `wikigene_name`, ""))
+    dim(data_ii)
+  
+  y_volc <- -log10(data_ii$pvalue)
+  volc_plot <- ggplot(data_ii, aes(x = log2FoldChange, y = y_volc)) +
+    ggtitle(label = comparison_labels[ii]) +
+    geom_point(aes(colour=padj < 0.05), shape=20, size=0.75) +
+    geom_text_repel(aes(label=TopGeneLabel), size = 8, box.padding = 1.0, segment.alpha = 0.5) +
+    labs(x="logFC", y="-log10(pvalue)") +
+    scale_color_manual(values = c("gray", "blue")) + 
+    theme_bw() +
+    theme(axis.text=element_text(size = 22),
+          axis.title=element_text(size = 22,face="bold"),
+          plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+          legend.title = element_text(size = 22, face = "bold"),
+          legend.text=element_text(size = 18))
+
+ 
+  grid.arrange(volc_plot)
+  
+}
+```
+
+Pathway analsyis
+```{r}
+if (exists("human.genes") == FALSE) {
+human.genes <- msigdbr(species = "Homo sapiens")
+genesets.interest <- filter(human.genes, gs_cat == "H" | gs_subcat == "CP:KEGG" | gs_subcat == "CP:REACTOME" | gs_subcat == "BP")
+pathways.interest <- genesets.interest %>% split(x = .$gene_symbol, f = .$gs_name)
+# GO biological pathways
+genesets.GOBP <- filter(human.genes, gs_subcat == "BP")
+pathways.GOBP <- genesets.GOBP %>% split(x = .$gene_symbol, f = .$gs_name)
+}
+
+#filter genelist for significant genes
+genelist <- c("resXFGvXBG_genelist", "resMFGvMBG_genelist", "resXFGvMFG_genelist", "resXBGvMBG_genelist", "resXFNvXBN_genelist", "resMFNvMBN_genelist", "resXFNvMFN_genelist", "resXBNvMBN_genelist", "resXFGvXFN_genelist", "resXBGvXBN_genelist", "resMFGvMFN_genelist", "resMBGvMBN_genelist")
+
+for (ii in 1:length(genelist)) {
+  sample <- genelist[ii]
+  filename <- paste0(sample, "_filt")
+  data_ii <- eval(parse(text = sample))
+  data_ii_filt <- data_ii %>%
+    filter(pvalue <= 0.05) %>%
+    dplyr::select(Human_Symbol_Unique, log2FoldChange) %>%
+    distinct() %>% 
+    pull(., var = 2, name = 1) %>% 
+    sort(., decreasing = T)
+  assign(x = filename, value = data_ii_filt)
+}
+
+# gsea: interesting pathways
+genelist_filt <- paste0(genelist, "_filt")
+
+for (ii in 1:length(genelist_filt)) {
+  sample <- genelist_filt[ii]
+  filename <- paste0(sample, "_gsea")
+  data_ii <- eval(parse(text = sample))
+  data_ii_gsea <- fgsea(pathways = pathways.interest,
+                  stats = data_ii) %>%
+                  arrange(desc(NES)) %>% 
+                  mutate(log10pval = -log10(pval)) %>%
+                  dplyr::select(pathway, pval, log10pval, everything())
+  assign(x = filename, value = data_ii_gsea)
+}
+
+# GO biological pathways
+
+for (ii in 1:length(genelist_filt)) {
+  sample <- genelist_filt[ii]
+  filename <- paste0(sample, "_gobp")
+  data_ii <- eval(parse(text = sample))
+  data_ii_gsea <- fgsea(pathways = pathways.GOBP,
+                  stats = data_ii) %>%
+                  arrange(desc(NES)) %>% 
+                  mutate(log10pval = -log10(pval)) %>%
+                  dplyr::select(pathway, pval, log10pval, everything())
+  assign(x = filename, value = data_ii_gsea)
+}
+```
+
+Plot the pathway analysis results
+```{r}
+source("/Users/weiss/Documents/R/Functions/go_term_bar.R")
+source("/Users/weiss/Documents/R/Functions/top_bottom_goterms_plot.R")
+
+genelist_filt_gsea <- paste0(genelist_filt, "_gsea")
+genelist_filt_gobp <- paste0(genelist_filt, "_gobp")
+
+for (ii in 1:length(genelist_filt_gobp)) {
+  sample <- genelist_filt_gobp[ii]
+  data_ii <- eval(parse(text = sample))
+  plot_bar <- go_term_bar(data_ii, 20, metric = "NES") +
+              ggtitle(label = genelist_filt_gobp[ii])
+  grid.arrange(plot_bar)
+}
+
+for (ii in 1:length(genelist_filt_gsea)) {
+  sample <- genelist_filt_gsea[ii]
+  data_ii <- eval(parse(text = sample))
+  plot_bar <- go_term_bar(data_ii, 20, metric = "NES") +
+              ggtitle(label = genelist_filt_gsea[ii])
+  grid.arrange(plot_bar)
+}
+  
+  #MBGvMBN pathway plot
+  sample <- genelist_filt_gobp[12]
+  data_ii <- eval(parse(text = sample))
+  MBGvMBN_bar <- go_term_bar(data_ii, 10, metric = "NES", fill = F, change_labels = T, pval_fill = T) +
+              ggtitle(label = "Control body melanocytes vs microenvironment") +
+              theme(axis.text=element_text(size = 22),
+              axis.title=element_text(size = 22,face="bold"),
+              plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  MBGvMBN_bar
+  #MFGvMFN pathway plot
+  sample <- genelist_filt_gobp[11]
+  data_ii <- eval(parse(text = sample))
+  MFGvMFN_bar <- go_term_bar(data_ii, 10, metric = "NES", fill = F, change_labels = T, pval_fill = T) +
+              ggtitle(label = "Control fin melanocytes vs microenvironment") +
+              theme(axis.text=element_text(size = 22),
+              axis.title=element_text(size = 22,face="bold"),
+              plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  MFGvMFN_bar
+  #XBGvXBN pathway plot
+  sample <- genelist_filt_gobp[10]
+  data_ii <- eval(parse(text = sample))
+  XBGvXBN_bar <- go_term_bar(data_ii, 10, metric = "NES", fill = F, change_labels = T, pval_fill = T) +
+              ggtitle(label = "Acral body melanocytes vs microenvironment") +
+              theme(axis.text=element_text(size = 22),
+              axis.title=element_text(size = 22,face="bold"),
+              plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  XBGvXBN_bar
+  #XFGvXFN pathway plot
+  sample <- genelist_filt_gobp[9]
+  data_ii <- eval(parse(text = sample))
+  XFGvXFN_bar <- go_term_bar(data_ii, 10, metric = "NES", fill = F, change_labels = T, pval_fill = T) +
+              ggtitle(label = "Acral fin melanocytes vs microenvironment") +
+              theme(axis.text=element_text(size = 22),
+              axis.title=element_text(size = 22,face="bold"),
+              plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  XFGvXFN_bar
+  grid.arrange(MBGvMBN_bar, MFGvMFN_bar)
+  grid.arrange(XBGvXBN_bar, XFGvXFN_bar)
+ 
+```
+
+
+Create GSEA plots for pathways of interest
+```{r}
+#plot multicellular growth pathway 
+pathway_plot = "GO_REGULATION_OF_MULTICELLULAR_ORGANISM_GROWTH"	
+pathway_genes <- pathways.interest[[pathway_plot]]
+gsea_results <- resXFGvXBG_genelist_filt_gsea
+gsea_genes <- resXFGvXBG_genelist_filt
+# 620 x 600
+barcodeplot(statistics = gsea_genes, index = pathway_genes, quantiles = c(0, 0), main = pathway_plot, xlab = "average log fold change", cex.main = 1.6) 
+gsea_results[gsea_results$pathway == pathway_plot, ] %>% pull(NES)
+
+
+#plot Appendage Development
+pathway_plot = "GO_APPENDAGE_DEVELOPMENT"	
+pathway_genes <- pathways.interest[[pathway_plot]]
+gsea_results <- resMFGvMBG_genelist_filt_gsea
+gsea_genes <- resMFGvMBG_genelist_filt
+# 620 x 600
+barcodeplot(statistics = gsea_genes, index = pathway_genes, quantiles = c(0, 0), main = pathway_plot, xlab = "average log fold change", cex.main = 1.6) 
+gsea_results[gsea_results$pathway == pathway_plot, ] %>% pull(NES)
+
+  
+pathway_plot = "GO_APPENDAGE_DEVELOPMENT"	
+pathway_genes <- pathways.interest[[pathway_plot]]
+gsea_results <- resXFGvXBG_genelist_filt_gsea
+gsea_genes <- resXFGvXBG_genelist_filt
+# 620 x 600
+barcodeplot(statistics = gsea_genes, index = pathway_genes, quantiles = c(0, 0), main = pathway_plot, xlab = "average log fold change", cex.main = 1.6) 
+gsea_results[gsea_results$pathway == pathway_plot, ] %>% pull(NES)
+```
+
+Waterfall plot highlighting limb and morphogenesis pathways in XFGvXBG and MFGvMBG
+```{r}
+#script Miranda wrote to generate a waterfall plot indicating where your pathways of interest lie relative to all other pathways.
+source("/Users/weiss/Documents/R/Functions/gsea_waterfall_plot_2.r")
+
+#identify limb and appendage pathways as well as morphogenesis and development related pathways and filter by pval < 0.05. 
+MFGvMBG_limb_pathways <- resMFGvMBG_genelist_filt_gobp[grep(pattern = "LIMB|APPENDAGE", 
+                                    x = resMFGvMBG_genelist_filt_gobp$pathway), ]%>%
+                                    filter(padj <= 0.05)
+MFGvMBG_positional_pathways <- resMFGvMBG_genelist_filt_gobp[grep(pattern ="MORPHOGENESIS|PATTERN|SPECIFICATION", 
+                                    x = resMFGvMBG_genelist_filt_gobp$pathway), ]%>%
+                                    filter(padj <= 0.05)
+
+#remove limb/appendage pathways from the morphogenesis pathway list so that they are labeled separately
+MFGvMBG_positional_pathways <- MFGvMBG_morphogenesis_pathways[!grep(pattern = "LIMB|APPENDAGE", 
+                                    x = MFGvMBG_morphogenesis_pathways$pathway), ]
+#only plot pathways with NES > 0
+resMFGvMBG_genelist_filt_gobp_NESfilt <- resMFGvMBG_genelist_filt_gobp %>%
+                                         filter(NES > 0)
+
+#Generate the waterfallplot displaying development/morphogenesis pathways in blue and limb/appendage pathways in red. Will plot all pathways analyzed and label only the pathways with pval < 0.05. Will plot all pathways will NES > 0.
+
+gsea_waterfall_plot2(gsea_results = resMFGvMBG_genelist_filt_gobp_NESfilt, 
+                    pathways_to_highlight_1 = MFGvMBG_limb_pathways, 
+                    pathways_to_highlight_2 = MFGvMBG_positional_pathways, 
+                    labels_for_plot = NULL, 
+                    n_terms = 2500)
+
+```

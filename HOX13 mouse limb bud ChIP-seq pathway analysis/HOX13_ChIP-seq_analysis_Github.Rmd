@@ -1,0 +1,69 @@
+---
+title: "HOX13_ChIP-seq_analysis"
+author: "Joshua Weiss"
+date: "9/3/2020"
+output: html_document
+---
+Import and process the data
+```{r}
+library(DESeq2)
+library(tidyverse)
+library("readxl")
+
+#read in ChIP-seq pathway analysis of HOXA13 and HOXD13. Raw data from Sheth et al., 2016 Cell Reports. Dataset is pooled pathways from KEGG, GO_Biological_Process, and GO_Molecular_Function.
+
+HOXA13_chip_data <- read_excel("/Users/weiss/Documents/R/HOX13_ChIP-seq/CistromePathwayAnalysis_pooled_pathways_HOXA13.xlsx")
+HOXD13_chip_data <- read_excel("/Users/weiss/Documents/R/HOX13_ChIP-seq/CistromePathwayAnalysis_pooled_pathways_HOXD13.xlsx")
+
+#generate a waterfall plot indicating where your pathways of interest lie relative to all other pathways.
+source("/Users/weiss/Documents/R/Functions/gsea_waterfall_plot_2.r")
+
+#put pathway name and then NES as the first two columns and rename to "pathway" and "NES" to make compatible with the function
+HOXA13_chip_data <- HOXA13_chip_data[,c(1,3,2,4,5)]
+colnames(HOXA13_chip_data) <- c("pathway", "NES", "N,n,B,b", "p_adj", "Gene number")
+
+HOXD13_chip_data <- HOXD13_chip_data[,c(1,3,2,4,5)]
+colnames(HOXD13_chip_data) <- c("pathway", "NES", "N,n,B,b", "p_adj", "Gene number")
+
+#generate a character vector with the exact names of the pathways you want highlighted on the waterfall plot in red and blue circles
+
+#identify pathways related to insulin or IGF and filter for pathways with p-adj < 0.05
+pathways_to_highlight_HOXA13 <- HOXA13_chip_data[grep(pattern = "insulin|mmu04931|mmu04911|mmu04910", 
+                                    x = HOXA13_chip_data$pathway), ]%>%
+                                    filter(p_adj <= 0.05)
+pathways_to_highlight_HOXD13 <- HOXD13_chip_data[grep(pattern = "insulin|mmu04931|mmu04911|mmu04910", 
+                                    x = HOXD13_chip_data$pathway), ]%>%
+                                    filter(p_adj <= 0.05)
+
+#identify pathways related to limb development and filter for pathways with p-adj < 0.05
+pathways_to_highlight_HOXA13_limb <- HOXA13_chip_data[grep(pattern = "GO:0009954|appendage|limb", x = HOXA13_chip_data$pathway), ]%>%
+                                      filter(p_adj <= 0.05)
+pathways_to_highlight_HOXD13_limb <- HOXD13_chip_data[grep(pattern = "GO:0009954|appendage|limb", x = HOXD13_chip_data$pathway), ]%>%
+                                      filter(p_adj <= 0.05)
+
+HOXA13_chip_data_filt <- HOXA13_chip_data %>%
+                            filter(NES > 0)
+HOXD13_chip_data_filt <- HOXD13_chip_data %>%
+                            filter(NES > 0)
+```
+
+Generate the waterfallplot displaying limb pathways in blue and insulin/igf pathways in red. Will plot all pathways analyzed and label only the pathways with p_adj < 0.05. Will plot all pathways will NES > 0 since log2(0) is negative infinite.
+```{r}
+gsea_waterfall_plot2(gsea_results = HOXD13_chip_data_filt, pathways_to_highlight_1 = pathways_to_highlight_HOXD13_limb, pathways_to_highlight_2 = pathways_to_highlight_HOXD13, labels_for_plot = NULL, n_terms = 5594)
+
+gsea_waterfall_plot2(gsea_results = HOXA13_chip_data_filt, pathways_to_highlight_1 = pathways_to_highlight_HOXA13_limb, pathways_to_highlight_2 = pathways_to_highlight_HOXA13, labels_for_plot = NULL, n_terms = 5625)
+
+```
+
+Generate histogram for pathways of interest: Plot the log2(NES) of Limb and IGF pathways for HOXA13 and HOXD13. 
+```{r}
+HOXA13_pathways <- HOXA13_chip_data[HOXA13_chip_data$pathway %in% pathways_to_highlight_HOXA13$pathway,]
+colnames(HOXA13_pathways) <- c("pathway", "NES", "N,n,B,b", "padj", "Gene number")
+
+HOXD13_pathways <- HOXD13_chip_data[HOXD13_chip_data$pathway %in% pathways_to_highlight_HOXD13$pathway,]
+colnames(HOXD13_pathways) <- c("pathway", "NES", "N,n,B,b", "padj", "Gene number")
+
+source("/Users/weiss/Documents/R/Functions/go_term_bar_2.R") #function to create plot
+go_term_bar(HOXA13_pathways, 8, metric = "NES", fill = F, change_labels = T, pval_fill = T)
+go_term_bar(HOXD13_pathways, 9, metric = "NES", fill = F, change_labels = T, pval_fill = T)
+```

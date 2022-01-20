@@ -1,0 +1,554 @@
+---
+title: "Acral_v_Cutaneous_RNA_seq_Hayward"
+author: "Joshua Weiss"
+date: "04/02/20"
+output: html_document
+---
+
+Adjust sampleinfo
+```{r cars}
+
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(ggfortify)
+library(RColorBrewer)
+library(viridis)
+
+# Read the sample information into a data frame 
+# Capitalize acral and cutaneous entries
+#Create a new column that combines subtype and specimen type (ie Acral Primary)
+
+sampleinfo <- read.csv("AM_vs_CM_samples.csv", header= TRUE, stringsAsFactors=F)
+sampleinfo <- sampleinfo[2:115,1:6] #simplify description and remove patient 4550 who may have either acral or cutaneous
+sampleinfo$Subtype[sampleinfo$Subtype == "acral"] <- "Acral"
+sampleinfo$Subtype[sampleinfo$Subtype == "cutaneous"] <- "Cutaneous"
+sampleinfo$Specimen.Type[sampleinfo$Specimen.Type == "Local recurrence"] <- "Local Recurrence"
+sampleinfo$group <- paste(sampleinfo$Subtype, sampleinfo$Specimen.Type, sep = " ") 
+```
+
+Import the data
+```{r}
+# Read the data into R
+AM_vs_CM_counts <- read.csv("Melanoma_AM_vs_CM.genes.ExpectedCounts.csv",
+                      header=TRUE,
+                      comment = "#")
+dim(AM_vs_CM_counts)
+AM_vs_CM_counts$MELA_4550 <- NULL # remove this sample from the dataset
+dim(AM_vs_CM_counts)
+
+countdata <- AM_vs_CM_counts %>%
+    column_to_rownames("Ensembl.Gene.ID") # turn the geneid column into rownames
+countdata <- data.matrix(countdata[,8:121,], rownames.force = NA)
+head(countdata)
+dim(countdata)
+
+#filter out genes with few to no counts
+keep <- rowSums(countdata, na.rm = TRUE) > 20
+countdata <- countdata[keep,]
+dim(countdata)
+
+#plot library size by sample name
+librarySizes <- colSums(countdata)
+barplot(librarySizes, 
+        names=names(librarySizes), 
+        las=2, 
+        main="Barplot of library sizes")
+abline(h=20e6, lty=2)
+
+#need to round the countdata to integer values to make it compatible with vst transformation
+countdata <- round(countdata, digits = 0)
+dim(countdata)
+head(countdata)
+
+#vst normalization instead of rlog due to having >30 samples
+vst_count <- vst(countdata, blind = FALSE)
+head(vst_count)
+
+#Plot the count distribution bloxplots with this data. How has this effected the count distributions?
+# make a colour vector
+statusCol <- as.numeric(factor(sampleinfo$Subtype)) + 1
+# Check distributions of samples using boxplots
+boxplot(vst_count, 
+        xlab="", 
+        ylab="Log2(Counts)",
+        las=2,
+        col=statusCol)
+# Let's add a blue horizontal line that corresponds to the median logCPM
+abline(h=median(as.matrix(vst_count)), col="blue")
+
+```
+PCA
+```{r}
+#PCA on all the samples; subtype = color and specimen type = shape
+pcDat <- prcomp(t(vst_count))
+
+#specify order of groups on legend
+sampleinfo$group <- factor(sampleinfo$group, 
+                           levels = c("Acral Primary", 
+                                      "Acral Local Recurrence", 
+                                      "Acral ITM", 
+                                      "Acral Regional Lymph Nodes", 
+                                      "Acral Distant Lymph Nodes",
+                                      "Cutaneous Primary", 
+                                      "Cutaneous Local Recurrence", 
+                                      "Cutaneous ITM", 
+                                      "Cutaneous Regional Lymph Nodes", 
+                                      "Cutaneous Distant Lymph Nodes"))
+autoplot(pcDat,
+         data = sampleinfo,
+         colour="group",
+         size=3,
+         x = 1,
+         y = 2,
+         scale = TRUE) +
+         theme_bw() +
+         scale_color_brewer(palette = "RdYlBu", direction = -1) +
+         ggtitle("PCA of all samples")
+
+```
+
+Convert counts to DESEQ DATASET
+```{r cars}
+# first lets check that our rows and columns match
+all(sampleinfo$donorLabel == colnames(countdata))
+# create the design formula
+# compare gene expression between all acral and cutaneous melanoma samples
+design <- as.formula(~ Subtype) 
+# compare gene expression between all acral and cutaneous melanoma samples and taking into account differences between sample type (ie. primary tumor, lymph node metastasis, distant metastsis, etc)
+design_complex <- as.formula(~ Specimen.Type + Subtype) 
+```
+
+DESeq
+```{r cars}
+##For all samples
+# rebuild a clean DDS object
+ddsObj <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData = sampleinfo,
+                              design = design)
+
+# Run DESeq
+ddsObj <- DESeq(ddsObj, betaPrior = TRUE)
+ddsObj$Subtype <- relevel(ddsObj$Subtype, ref = "Cutaneous")
+##########################################################################################
+
+###Do the same but with the complex design
+ddsObj_complex <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData = sampleinfo,
+                              design = design_complex)
+
+# Run DESeq
+ddsObj_complex <- DESeq(ddsObj_complex, betaPrior = TRUE)
+ddsObj_complex$Subtype <- relevel(ddsObj_complex$Subtype, ref = "Cutaneous")
+```
+
+
+
+Generate a results table
+```{r cars}
+resAvC <- results(ddsObj, alpha=0.05, contrast = c("Subtype", "Acral", "Cutaneous"))
+dim(resAvC)
+
+resAvC_complex <- results(ddsObj_complex, alpha=0.05, contrast = c("Subtype", "Acral", "Cutaneous"))
+dim(resAvC_complex)
+```
+
+Add human gene names to all results dataframes
+```{r setup, include=FALSE}
+library(biomaRt)
+library(GenomicFeatures)
+library(DESeq2)
+library(tidyverse)
+library(xlsx)
+library("readxl")
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+
+resAvC_list = list(resAvC = as.data.frame(resAvC),
+                   resAvC_complex = as.data.frame(resAvC_complex)
+                   )
+
+resAvC_list_named = lapply(resAvC_list, function(j) {
+  j %>% 
+    rownames_to_column(., "Ensembl") %>%
+    merge(x = .,
+          y = getBM(filters = "ensembl_gene_id", 
+                    attributes = c("ensembl_gene_id","description", "wikigene_name"),
+                    values = .$Ensembl, 
+                    mart = mart),
+          by.x = "Ensembl",
+          by.y = "ensembl_gene_id") %>%
+    .[.$wikigene_name != "",]
+})
+
+resAvC_data <- resAvC_list_named[["resAvC"]]
+
+resAvC_c_data <- resAvC_list_named[["resAvC_complex"]]
+```
+
+Visual Gene Expression Differences Between Acral and Cutaneous Samples
+```{r}
+
+comparisons <- c("resAvC_data", "resAvC_c_data")
+
+comparison_labels <- c("Acral vs Cutaneous Melanoma: All Samples", "Acral vs Cutaneous Melanoma: All Samples (complex)")
+
+genes_of_interest <- c("HOXA13", "HOXB13", "HOXD13", "TBX4", "DLX4", "HAND2")
+
+
+library(ggplot2)
+library(ggrepel)
+library(gridExtra)
+library(RColorBrewer)
+
+for (ii in 1:length(comparisons)) {
+  sample <- comparisons[ii]
+  data_ii <- eval(parse(text = sample))
+  data_ii <- data_ii %>% 
+    mutate(TopGeneLabel=ifelse(wikigene_name %in% genes_of_interest, `wikigene_name`, ""))
+    dim(data_ii)
+  
+  y_volc <- -log10(data_ii$pvalue)
+  volc_plot <- ggplot(data_ii, aes(x = log2FoldChange, y = y_volc)) +
+    ggtitle(label = comparison_labels[ii]) +
+    geom_point(aes(colour=padj < 0.05), shape=20, size=0.6) +
+    geom_text_repel(aes(label=TopGeneLabel), size = 9, box.padding = 1.0, segment.alpha = 0.5) +
+    labs(x="logFC", y="-log10(pvalue)") +
+    scale_color_manual(values = c("gray", "blue")) + 
+    theme_bw() +
+    theme(axis.text=element_text(size = 22),
+          axis.title=element_text(size = 22,face="bold"),
+          plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+          legend.title = element_text(size = 22, face = "bold"),
+          legend.text=element_text(size = 18))
+ 
+  grid.arrange(volc_plot)
+  
+}
+```
+
+Pathway analsyis
+```{r}
+require(fgsea)
+require(msigdbr)
+require(limma)
+if (exists("human.genes") == FALSE) {
+human.genes <- msigdbr(species = "Homo sapiens")
+# GO biological pathways
+genesets.GOBP <- filter(human.genes, gs_subcat == "BP")
+pathways.GOBP <- genesets.GOBP %>% split(x = .$gene_symbol, f = .$gs_name)
+}
+
+#filter genelist for significant genes
+
+resAvC_list_filt <- lapply(resAvC_list_named, function(j) {
+  j %>%
+    .[grep(pattern = "^RPS|^RPL", x = .$wikigene_name, invert = T, ignore.case = T),] %>%
+    filter(pvalue <= 0.05) %>%
+    dplyr::select(wikigene_name, log2FoldChange) %>%
+    distinct(., wikigene_name, .keep_all = T) %>%
+    deframe()
+})
+
+
+
+resAvC_filt <- resAvC_list_filt[["resAvC"]]
+resAvC_c_filt <- resAvC_list_filt[["resAvC_complex"]]
+
+
+# gsea: gobp pathways
+for (ii in 1:length(comparisons_filt)) {
+  sample <- comparisons_filt[ii]
+  filename <- paste0(sample, "_gobp")
+  data_ii <- eval(parse(text = sample))
+  data_ii_gobp <- fgsea(pathways = pathways.GOBP,
+                  stats = data_ii) %>%
+                  arrange(desc(NES)) %>% 
+                  mutate(log10pval = -log10(pval)) %>%
+                  dplyr::select(pathway, pval, log10pval, everything())
+  assign(x = filename, value = data_ii_gobp)
+}
+```
+
+Plot the pathway analysis results
+```{r}
+source("/Users/weiss/Documents/R/Functions/go_term_bar.R")
+library(pals)
+library(gridExtra)
+
+go_term_bar_data <- c("resAvC_filt_gobp", "resAvC_c_filt_gobp")
+
+go_term_labels <- c("GSEA Acral v Cutaneous: All Samples", "GSEA Acral v Cutaneous: All Samples (complex)")
+                      
+for (ii in 1:length(go_term_bar_data)) {
+  sample <- go_term_bar_data[ii]
+  data_ii <- eval(parse(text = sample))
+  plot_ii <- go_term_bar(data_ii, 22, metric = "NES", fill = F, change_labels = T, pval_fill = F) + ggtitle(label = go_term_labels[ii])
+
+  grid.arrange(plot_ii)
+  
+}
+```
+
+
+Plot pathways of interest: GOBP
+```{r}
+
+#plot Appendage Development from all samples complex design
+pathway_plot = "GO_APPENDAGE_DEVELOPMENT"	
+pathway_genes <- pathways.GOBP[[pathway_plot]]
+gsea_results <- resAvC_c_filt_gobp
+gsea_genes <- resAvC_c_filt
+# 620 x 600
+barcodeplot(statistics = gsea_genes, index = pathway_genes, quantiles = c(0, 0), main = paste0(pathway_plot), xlab = "average log fold change", cex.main = 1.6)
+#normalized enrichment score
+gsea_results[gsea_results$pathway == pathway_plot, ] %>% pull(NES)
+```
+
+PCA based only on HOX gene expression
+```{r}
+#merge gene names to vst normalized dataframe 
+
+vst_count_named <- as.data.frame(vst_count) %>%
+                    rownames_to_column(., var = "Ensembl") %>%
+                    merge(., y = resAvC_c_data,
+                    by.x = "Ensembl") %>% #have it be just gene name as first column and sample data
+                    .[,c(123,2:115)] %>%
+                    .[duplicated(.[,1])==F,] #remove duplicates
+
+row.names(vst_count_named) <- vst_count_named$wikigene_name #make gene name the rowname
+vst_count_named <- vst_count_named[,2:115] #remove extra gene column
+
+hox_genes <- c("HOXA1", "HOXB1","HOXD1", "HOXA2", "HOXB2", "HOXA3", "HOXB3", "HOXD3", "HOXA4", "HOXB4", "HOXC4", "HOXD4", "HOXA5", "HOXB5", "HOXC5", "HOXA6", "HOXB6", "HOXC6", "HOXA7", "HOXB7", "HOXB8", "HOXC8", "HOXD8", "HOXA9", "HOXB9", "HOXC9", "HOXD9", "HOXA10", "HOXC10", "HOXD10", "HOXA11", "HOXC11", "HOXD11", "HOXC12", "HOXD12", "HOXA13", "HOXB13", "HOXC13", "HOXD13")
+
+#Find the rows with HOX genes
+vst_count_hox <- subset(vst_count_named, rownames(vst_count_named) %in% hox_genes)
+vst_count_hox <- as.matrix(vst_count_hox)
+vst_count_hox_order <- vst_count_hox[hox_genes,]
+
+
+library(ggfortify)
+library(RColorBrewer)
+pcHox <- prcomp(t(vst_count_hox_order))
+
+
+autoplot(pcHox,
+         data = sampleinfo,
+         colour="group",
+         size=3,
+         x = 1,
+         y = 2,
+         scale = TRUE) +
+         theme_bw() +
+         scale_color_brewer(palette = "RdYlBu", direction = -1) +
+         ggtitle("PCA of HOX gene expression: Subtype and Tumor Stage")+ 
+         theme(plot.title = element_text(hjust = 0.5))
+```
+
+HOMER analysis on resAvC_c_data
+```{r}
+#resAvC_c
+resAvC_c_homer <- resAvC_c_data
+
+#filter for genes where Log2FC is >0.25 or <0.25 and padj < 0.05 and filter out ribosomal genes
+keep_AvC <-resAvC_c_homer$log2FoldChange > 0.25 | resAvC_c_homer$log2FoldChange < -0.25
+resAvC_c_homer <- resAvC_c_homer[keep_AvC,]
+keep_resAvC_sig <- resAvC_c_homer$padj < 0.05
+resAvC_c_homer <- resAvC_c_homer[keep_resAvC_sig,]
+resAvC_c_homer <- na.omit(resAvC_c_homer)
+
+resAvC_c_homer <- resAvC_c_homer[grep(pattern = "rps|rpl", 
+                                    x = resAvC_c_homer$wikigene_name,
+                                    invert = TRUE, 
+                                    ignore.case = TRUE), ]
+
+write.table(resAvC_c_homer,"resAvC_c_homer.txt",sep="\t",row.names=FALSE, quote = FALSE)
+
+#make a version of resAvC_c_homer with just the upregulated or downregulated genes
+resAvC_c_homer_up <- resAvC_c_homer[resAvC_c_homer$log2FoldChange > 0,]
+resAvC_c_homer_down <- resAvC_c_homer[resAvC_c_homer$log2FoldChange < 0,]
+write.table(resAvC_c_homer_up,"resAvC_c_homer_up.txt",sep="\t",row.names=FALSE, quote = FALSE)
+write.table(resAvC_c_homer_down,"resAvC_c_homer_down.txt",sep="\t",row.names=FALSE, quote = FALSE)
+
+##resAvC
+resAvC_homer <- resAvC_data
+
+#filter for genes where Log2FC is >0.25 or <0.25 and padj < 0.05 and filter out ribosomal genes
+keep_AvC <-resAvC_homer$log2FoldChange > 0.25 | resAvC_homer$log2FoldChange < -0.25
+resAvC_homer <- resAvC_homer[keep_AvC,]
+keep_resAvC_sig <- resAvC_homer$padj < 0.05
+resAvC_homer <- resAvC_homer[keep_resAvC_sig,]
+resAvC_homer <- na.omit(resAvC_homer)
+
+resAvC_homer <- resAvC_homer[grep(pattern = "rps|rpl", 
+                                    x = resAvC_homer$wikigene_name,
+                                    invert = TRUE, 
+                                    ignore.case = TRUE), ]
+
+write.table(resAvC_homer,"resAvC_homer.txt",sep="\t",row.names=FALSE, quote = FALSE)
+
+#make a version of resAvC_homer with just the upregulated or downregulated genes
+resAvC_homer_up <- resAvC_homer[resAvC_homer$log2FoldChange > 0,]
+resAvC_homer_down <- resAvC_homer[resAvC_homer$log2FoldChange < 0,]
+write.table(resAvC_homer_up,"resAvC_homer_up.txt",sep="\t",row.names=FALSE, quote = FALSE)
+write.table(resAvC_homer_down,"resAvC_homer_down.txt",sep="\t",row.names=FALSE, quote = FALSE)
+```
+
+Plot genes of interest
+```{r}
+
+library(gridExtra)
+#plot HOXA13, HOXB13, HOXD13, TBX4, DLX4, HAND2 expression
+genes_of_interest <- c("HOXA13", "HOXB13", "HOXD13", "TBX4", "DLX4", "HAND2")
+genes_of_interest_plots <- paste0(genes_of_interest,"_plot")
+for (ii in 1:length(genes_of_interest)) {
+  gene_ii <- genes_of_interest[ii]
+  data_ii <- vst_count_named[rownames(vst_count_named) == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample")
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- sampleinfo$Subtype
+  data_ii$group <- factor(data_ii$group,levels = c("Cutaneous","Acral"))
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = gene_id, fill = group)) +
+              geom_boxplot() +
+              scale_fill_manual(values = c("mediumseagreen","navyblue")) +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text.y=element_text(size = 12, face = "bold"),
+                axis.title.y=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5),
+                axis.title.x =element_blank(),
+                axis.text.x=element_blank(),
+                legend.position = "none")
+              
+  assign(x = genes_of_interest_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(HOXA13_plot, HOXB13_plot, HOXD13_plot, TBX4_plot, DLX4_plot, HAND2_plot,  nrow = 2)
+
+#plot CRKL and GAB2 expression
+genes_of_interest <- c("CRKL", "GAB2")
+genes_of_interest_plots <- paste0(genes_of_interest,"_plot")
+for (ii in 1:length(genes_of_interest)) {
+  gene_ii <- genes_of_interest[ii]
+  data_ii <- vst_count_named[rownames(vst_count_named) == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample")
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- sampleinfo$Subtype
+  data_ii$group <- factor(data_ii$group,levels = c("Cutaneous","Acral"))
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = gene_id, fill = group)) +
+              geom_boxplot() +
+              scale_fill_manual(values = c("mediumseagreen","navyblue")) +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text.y=element_text(size = 12, face = "bold"),
+                axis.title.y=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5),
+                axis.title.x =element_blank(),
+                axis.text.x=element_blank(),
+                legend.position = "none")
+              
+  assign(x = genes_of_interest_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(CRKL_plot, GAB2_plot)
+
+
+#expression of other gene found to be specifically amplified in Acral melanoma by MSK-IMPACT
+acral_amplified_genes <- c("PTP4A1", "MDM2", "CDK4", "PAK1", "YAP1", "BIRC3", "FGF4", "FGF3", "TERT", "CCND1", "FGF19")
+acral_amplified_plots <- paste0(acral_amplified_genes,"_plot")
+
+for (ii in 1:length(acral_amplified_genes)) {
+  gene_ii <- acral_amplified_genes[ii]
+  data_ii <- vst_count_named[rownames(vst_count_named) == gene_ii,] %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column(var = "sample")
+  colnames(data_ii) <- c("sample", "gene_id")
+  
+  data_ii$group <- sampleinfo$Subtype
+  data_ii$group <- factor(data_ii$group,levels = c("Cutaneous","Acral"))
+  
+  plot_ii <- ggplot(data_ii, aes(x = group, y = gene_id, fill = group)) +
+              geom_boxplot() +
+              scale_fill_manual(values = c("mediumseagreen","navyblue")) +
+              ylab(paste0("log normalized counts")) +
+              ggtitle(gene_ii) +
+              theme_bw() +
+              guides(fill=guide_legend(title=NULL)) +
+              theme(axis.text.y=element_text(size = 12, face = "bold"),
+                axis.title.y=element_text(size = 14,face="bold"),
+                plot.title=element_text(size = 16, face = "bold", hjust = 0.5),
+                axis.title.x =element_blank(),
+                axis.text.x=element_blank(),
+                legend.position = "none")
+              
+  assign(x = acral_amplified_plots[ii], value = plot_ii)
+  
+  grid.arrange(plot_ii)
+  
+}
+
+grid.arrange(PTP4A1_plot, MDM2_plot, CDK4_plot, PAK1_plot, YAP1_plot, BIRC3_plot, FGF4_plot, FGF3_plot, TERT_plot, CCND1_plot, FGF19_plot, nrow = 2)
+
+
+```
+
+
+
+
+
+
+Waterfall plot highlighting limb and morphogenesis pathways in Acral vs Cutaneous
+```{r}
+#script Miranda wrote to generate a waterfall plot indicating where your pathways of interest lie relative to all other pathways.
+source("/Users/weiss/Documents/R/Functions/gsea_waterfall_plot_2.r")
+
+#identify limb and appendage pathways as well as morphogenesis and development related pathways and filter by pval < 0.05. 
+limb_pathways <- resAvC_c_filt_gobp[grep(pattern = "LIMB|APPENDAGE", 
+                                    x = resAvC_c_filt_gobp$pathway), ]%>%
+                                    filter(padj <= 0.05)
+
+positional_pathways <- resAvC_c_filt_gobp[grep(pattern ="MORPHOGENESIS|PATTERN|SPECIFICATION|REGIONALIZATION", 
+                                    x = resAvC_c_filt_gobp$pathway), ]%>%
+                                    filter(padj <= 0.05)
+#remove the heart and appendage related pathways
+positional_pathways <- positional_pathways[!grep(
+                                          pattern ="CARDIAC|HEART|APPENDAGE", 
+                                          x = positional_pathways$pathway), ]
+
+#only plot pathways with NES > 0
+resAvC_c_filt_gobp_NESfilt <- resAvC_c_filt_gobp %>%
+                                    filter(NES > 0)
+
+
+#Generate the waterfallplot displaying development/morphogenesis pathways in blue and limb/appendage pathways in red. Will plot all pathways analyzed and label only the pathways with pval < 0.05. Will plot all pathways will NES > 0.
+
+gsea_waterfall_plot2(gsea_results = resAvC_c_filt_gobp_NESfilt, 
+                    pathways_to_highlight_1 = limb_pathways, 
+                    pathways_to_highlight_2 = positional_pathways, 
+                    labels_for_plot = NULL, 
+                    n_terms = 2000)
+
+
+```
+
+

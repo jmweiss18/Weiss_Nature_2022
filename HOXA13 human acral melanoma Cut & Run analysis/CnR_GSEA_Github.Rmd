@@ -1,0 +1,38 @@
+---
+title: "CnR GSEA"
+author: "Joshua Weiss"
+date: "7/20/2021"
+output: html_document
+---
+
+Load in packages
+```{r}
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+require(fgsea)
+require(msigdbr)
+require(limma)
+library("readxl")
+```
+
+Cistrome Go Analysis of all 4 HOXA13 samples analyzed individually looking at Go_Biological_Process, Go_Molecular_Function, and KEGG pathways
+Cistrome GO analysis performed using http://go.cistrome.org
+```{r}
+HOXA13_CnR_data_ind <- read_excel("/Users/weiss/Documents/R/CnR GSEA/CnR_Cistrome_GO_HOXA13_Ind_Rep_GSEA_Pooled_Pathways.xlsx")
+colnames(HOXA13_CnR_data_ind) <- c("pathway", "N,n,B,b", "NES", "p_value", "padj", "Gene_number")
+HOXA13_CnR_data_ind <- HOXA13_CnR_data_ind %>% arrange(desc(NES))
+
+```
+
+Plot the top enriched pathways as histograms
+```{r}
+source("/Users/weiss/Documents/R/Functions/go_term_bar.R")
+go_term_bar(HOXA13_CnR_data_ind, n_terms = 20, metric = "NES", fill = F, pval_fill = F)
+#rename p_adj to p_val so the function can incorporate p-value into the plot
+HOXA13_CnR_data_ind2 <- HOXA13_CnR_data_ind
+colnames(HOXA13_CnR_data_ind2) <- c("pathway", "N,n,B,b", "NES", "p_value", "pval", "Gene_number")
+go_term_bar(HOXA13_CnR_data_ind2, n_terms = 20, metric = "NES", fill = F, pval_fill = T)
+
+```
